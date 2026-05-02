@@ -1,0 +1,17 @@
+{
+  "name": "france-relay",
+  "version": "1.0.0",
+  "description": "France Relay Server for mhr-cfw — replaces Cloudflare Worker",
+  "type": "module",
+  "main": "relay.js",
+  "scripts": {
+    "start": "node relay.js",
+    "dev": "node --watch relay.js"
+  },
+  "dependencies": {
+    "express": "4.21.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
