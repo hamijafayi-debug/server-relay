@@ -36,7 +36,10 @@ const ALLOWED_METHODS = new Set([
 const MAX_BODY_SIZE = 50 * 1024 * 1024; // 50MB — کافی برای هر chunk
 
 // ─── Middleware ────────────────────────────────────────────────────
-app.use(express.json({ limit: '20mb' }));
+// جلوگیری از اضافه شدن x-forwarded-* توسط Express به upstream
+app.set("trust proxy", false);
+
+app.use(express.json({ limit: "20mb" }));
 
 // ─── Health Check ─────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
@@ -112,6 +115,14 @@ app.post('/', async (req, res) => {
       return res.status(400).json({ e: 'invalid base64 body' });
     }
   }
+
+  // ── DEBUG موقتی ─────────────────────────────────────────────────────
+  console.log("[debug] req.headers از GAS:", JSON.stringify({
+    "x-forwarded-for": req.headers["x-forwarded-for"],
+    "via": req.headers["via"],
+    "forwarded": req.headers["forwarded"],
+  }));
+  console.log("[debug] headers ارسالی به upstream:", JSON.stringify(headers));
 
   // ── ۷. Fetch با timeout 25s (کمتر از GAS timeout 30s) ────────────
   const controller = new AbortController();
