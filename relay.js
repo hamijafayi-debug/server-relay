@@ -24,6 +24,9 @@ const { API_KEY = 'changeme', PORT = '3000' } = process.env;
 const BLOCKED_HEADERS = new Set([
   'host', 'connection', 'transfer-encoding',
   'content-length', 'x-relay-hop', 'proxy-authorization',
+  // هدرهایی که هویت پروکسی را لو می‌دهند — حذف شوند
+  'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto',
+  'forwarded', 'via',
 ]);
 
 const ALLOWED_METHODS = new Set([
@@ -95,6 +98,10 @@ app.post('/', async (req, res) => {
   } else if (b && !headers['content-type']) {
     headers['content-type'] = 'application/octet-stream';
   }
+
+  // اطمینان از حذف هدرهای proxy-identifying — دفاع دوم
+  ['x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'forwarded', 'via']
+    .forEach(hdr => delete headers[hdr]);
 
   // ── ۶. Body decode (base64 → Buffer) ─────────────────────────────
   let reqBody;
