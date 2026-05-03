@@ -1,33 +1,18 @@
 // ═══════════════════════════════════════════════════════════════════
-// relay.js — France Relay Server for mhr-cfw
+// relay.js — France Relay Server for mhr-cfw (SECURE VERSION)
 // سازگار ۱۰۰٪ با mhr-cfw Python client
-// بهینه‌شده برای سرعت — فقط express، بدون dependency اضافه
+// بهینه‌شده برای سرعت و امنیت — جلوگیری از نشت IP و Headers
 // Node.js 18+ (fetch داخلی)
-// ═══════════════════════════════════════════════════════════════════
-//
-// Environment Variables:
-//   API_KEY = کلید_قوی (همان auth_key در config.json)
-//   PORT    = 3000 (پیش‌فرض)
-//
-// فرمت ورودی (از GAS):
-//   POST / { k, u, m, h, b, ct, r }
-//
-// فرمت خروجی (به GAS):
-//   { s, h, b }
 // ═══════════════════════════════════════════════════════════════════
 
 import express from 'express';
+import dns from 'node:dns';
+
+// اجبار به استفاده از IPv4 برای جلوگیری از نشت اطلاعات در شبکه IPv6
+dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
 const { API_KEY = 'changeme', PORT = '3000' } = process.env;
-
-const BLOCKED_HEADERS = new Set([
-  'host', 'connection', 'transfer-encoding',
-  'content-length', 'x-relay-hop', 'proxy-authorization',
-  // هدرهایی که هویت پروکسی را لو می‌دهند — حذف شوند
-  'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto',
-  'forwarded', 'via',
-]);
 
 const ALLOWED_METHODS = new Set([
   'GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS',
@@ -36,7 +21,7 @@ const ALLOWED_METHODS = new Set([
 const MAX_BODY_SIZE = 50 * 1024 * 1024; // 50MB — کافی برای هر chunk
 
 // ─── Middleware ────────────────────────────────────────────────────
-// جلوگیری از اضافه شدن x-forwarded-* توسط Express به upstream
+// جلوگیری قطعی از اضافه شدن هدرهای x-forwarded-* توسط Express
 app.set("trust proxy", false);
 
 app.use(express.json({ limit: "20mb" }));
@@ -45,7 +30,7 @@ app.use(express.json({ limit: "20mb" }));
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
-    server: 'france-relay',
+    server: 'france-relay-secure',
     node: process.version,
     uptime: Math.floor(process.uptime()),
     ts: Date.now(),
@@ -86,25 +71,37 @@ app.post('/', async (req, res) => {
     return res.status(400).json({ e: 'method not allowed' });
   }
 
-  // ── ۵. Headers ────────────────────────────────────────────────────
+  // ── ۵. Headers (رویکرد لیست سفید برای امنیت ۱۰۰٪) ─────────────────
   const headers = {};
+  
+  // لیست سفید: فقط این هدرهای استاندارد مرورگر اجازه عبور دارند
+  const WHITELIST = new Set([
+    'accept', 'accept-encoding', 'accept-language', 'authorization',
+    'cache-control', 'cookie', 'origin', 'referer', 'user-agent',
+    'dnt', 'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform',
+    'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-user',
+    'upgrade-insecure-requests'
+  ]);
+
   if (h && typeof h === 'object') {
     for (const [k, v] of Object.entries(h)) {
-      if (typeof k === 'string' && typeof v === 'string'
-          && !BLOCKED_HEADERS.has(k.toLowerCase())) {
-        headers[k] = v;
+      const lowerKey = k.toLowerCase();
+      // فقط هدرهایی کپی می‌شوند که در لیست سفید بالا باشند
+      if (WHITELIST.has(lowerKey)) {
+        headers[lowerKey] = v;
       }
     }
   }
+
+  // تنظیم محتوا
   if (ct && typeof ct === 'string') {
     headers['content-type'] = ct;
   } else if (b && !headers['content-type']) {
     headers['content-type'] = 'application/octet-stream';
   }
 
-  // اطمینان از حذف هدرهای proxy-identifying — دفاع دوم
-  ['x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'forwarded', 'via']
-    .forEach(hdr => delete headers[hdr]);
+  // اجبار به عدم استفاده از Keep-Alive برای کاهش ریسک ردیابی کانکشن
+  headers['connection'] = 'close';
 
   // ── ۶. Body decode (base64 → Buffer) ─────────────────────────────
   let reqBody;
@@ -116,15 +113,9 @@ app.post('/', async (req, res) => {
     }
   }
 
-  // ── DEBUG موقتی ─────────────────────────────────────────────────────
-  console.log("[debug] req.headers از GAS:", JSON.stringify({
-    "x-forwarded-for": req.headers["x-forwarded-for"],
-    "via": req.headers["via"],
-    "forwarded": req.headers["forwarded"],
-  }));
-  console.log("[debug] headers ارسالی به upstream:", JSON.stringify(headers));
+  // توقف لاگ‌گیری: کدهای لاگ‌گیری حذف شدند تا کوکی‌ها و API Key لو نروند
 
-  // ── ۷. Fetch با timeout 25s (کمتر از GAS timeout 30s) ────────────
+  // ── ۷. Fetch با timeout 25s ───────────────────────────────────────
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 25_000);
 
@@ -186,17 +177,13 @@ app.use((_req, res) => res.status(404).json({ e: 'not found' }));
 const server = app.listen(+PORT, '0.0.0.0', () => {
   console.log('');
   console.log('  ┌──────────────────────────────────────┐');
-  console.log('  │   🇫🇷  France Relay — mhr-cfw        │');
+  console.log('  │   🇫🇷 France Relay (Secure) — mhr-cfw │');
   console.log('  └──────────────────────────────────────┘');
   console.log('  Port   : ' + PORT);
   console.log('  Node   : ' + process.version);
   console.log('  Auth   : ' + (API_KEY !== 'changeme' ? '✅ configured' : '⚠️  CHANGE API_KEY!'));
   console.log('  Health : http://localhost:' + PORT + '/health');
   console.log('');
-  if (API_KEY === 'changeme') {
-    console.log('  ⚠️  WARNING: API_KEY is default — set it in environment!');
-    console.log('');
-  }
 });
 
 // ─── Graceful Shutdown ────────────────────────────────────────────
