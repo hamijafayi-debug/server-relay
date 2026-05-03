@@ -1,13 +1,13 @@
 // ═══════════════════════════════════════════════════════════════════
 // relay.js — France Relay Server for mhr-cfw
-// v4.0 — حل کامل نشت X-Forwarded-For و via
+// v4.1 — بدون dependency خارجی، حل کامل نشت via و X-Forwarded-For
+// فقط: express + node:http + node:https + node:dns
 // ═══════════════════════════════════════════════════════════════════
 
-import express from 'express';
-import dns from 'node:dns';
-import { createServer } from 'node:https';
-import { Agent } from 'node:https';
-import { Agent as HttpAgent } from 'node:http';
+import express  from 'express';
+import dns      from 'node:dns';
+import http     from 'node:http';
+import https    from 'node:https';
 
 // ── اول از همه: اجبار IPv4 ────────────────────────────────────────
 dns.setDefaultResultOrder('ipv4first');
@@ -15,31 +15,37 @@ dns.setDefaultResultOrder('ipv4first');
 const app = express();
 const { API_KEY = 'changeme', PORT = '3000' } = process.env;
 
-// ── Custom HTTP/HTTPS Agent ────────────────────────────────────────
-// این مهمه — Agent جداگانه برای کنترل دقیق connection
-const httpsAgent = new Agent({
-  keepAlive: false,      // هر request یک connection جدید
-  timeout: 25000,
-  family: 4,             // ← اجبار IPv4 در سطح socket
+const MAX_BODY_SIZE = 50 * 1024 * 1024; // 50MB
+
+// ════════════════════════════════════════════════════════════════════
+// HTTP/HTTPS Agent — keepAlive:false + family:4
+// ════════════════════════════════════════════════════════════════════
+
+const HTTP_AGENT = new http.Agent({
+  keepAlive : false,   // هر request یک connection جدید
+  family    : 4,       // ← اجبار IPv4 در سطح socket
+  timeout   : 25000,
 });
 
-const httpAgent = new HttpAgent({
-  keepAlive: false,
-  timeout: 25000,
-  family: 4,             // ← اجبار IPv4 در سطح socket
+const HTTPS_AGENT = new https.Agent({
+  keepAlive          : false,
+  family             : 4,    // ← اجبار IPv4 در سطح socket
+  timeout            : 25000,
+  rejectUnauthorized : true,
 });
 
 // ════════════════════════════════════════════════════════════════════
 // فیلتر هدرها
 // ════════════════════════════════════════════════════════════════════
 
-const BLOCKED_HEADERS_EXACT = new Set([
+const BLOCKED_EXACT = new Set([
+  // زیرساخت HTTP
   'host', 'connection', 'keep-alive', 'transfer-encoding',
   'content-length', 'te', 'trailer', 'upgrade',
-  'proxy-authorization', 'proxy-connection', 'x-relay-hop',
 
-  // ── اینا مهم‌ترین هستن برای جلوگیری از نشت ──────────────────
-  'x-forwarded-for',    // ← Google IP chain
+  // پروکسی / relay identity — مهم‌ترین بخش
+  'proxy-authorization', 'proxy-connection', 'x-relay-hop',
+  'x-forwarded-for',    // ← Google IP chain را حذف کن
   'x-forwarded-host',
   'x-forwarded-proto',
   'x-forwarded-port',
@@ -47,7 +53,7 @@ const BLOCKED_HEADERS_EXACT = new Set([
   'forwarded',
   'via',                // ← "1.1 google" را حذف کن
 
-  // ── هویت گوگل ─────────────────────────────────────────────────
+  // هویت گوگل
   'cookie', 'set-cookie', 'authorization',
   'x-client-data', 'x-goog-authuser',
   'x-goog-encode-response-if-executable',
@@ -56,103 +62,137 @@ const BLOCKED_HEADERS_EXACT = new Set([
   'x-origin', 'x-javascript-user-agent',
   'x-requested-with', 'origin', 'referer',
 
-  // ── browser fingerprint ────────────────────────────────────────
-  'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest',
-  'sec-fetch-user', 'sec-ch-ua', 'sec-ch-ua-mobile',
-  'sec-ch-ua-platform', 'sec-ch-ua-arch', 'sec-ch-ua-bitness',
-  'sec-ch-ua-full-version', 'sec-ch-ua-full-version-list',
-  'sec-ch-ua-model', 'sec-ch-ua-platform-version', 'sec-ch-ua-wow64',
+  // browser fingerprint
+  'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest', 'sec-fetch-user',
+  'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform',
+  'sec-ch-ua-arch', 'sec-ch-ua-bitness', 'sec-ch-ua-full-version',
+  'sec-ch-ua-full-version-list', 'sec-ch-ua-model',
+  'sec-ch-ua-platform-version', 'sec-ch-ua-wow64',
 ]);
 
 const BLOCKED_PREFIXES = [
   'x-goog-', 'x-google-', 'x-firebase-', 'sec-ch-', 'sec-fetch-',
 ];
 
-function isHeaderBlocked(name) {
-  const lower = name.toLowerCase();
-  if (BLOCKED_HEADERS_EXACT.has(lower)) return true;
+function isBlocked(name) {
+  const l = name.toLowerCase();
+  if (BLOCKED_EXACT.has(l)) return true;
   for (const p of BLOCKED_PREFIXES) {
-    if (lower.startsWith(p)) return true;
+    if (l.startsWith(p)) return true;
   }
   return false;
 }
 
 // ════════════════════════════════════════════════════════════════════
-// هدرهای ثابت relay
-// هر چیزی که اینجاست، override میکنه هدرهای کلاینت را
+// ساخت هدرهای تمیز
 // ════════════════════════════════════════════════════════════════════
 
-function buildCleanHeaders(clientHeaders, ct, hasBody) {
-  // ── لایه ۱: هدرهای مجاز از کلاینت ──────────────────────────────
-  const headers = {};
-  for (const [name, value] of Object.entries(clientHeaders)) {
-    if (typeof name !== 'string' || typeof value !== 'string') continue;
-    if (name.length > 100 || value.length > 8192) continue;
-    if (!/^[\w\-]+$/.test(name)) continue;
-    if (!isHeaderBlocked(name)) {
-      headers[name.toLowerCase()] = value;
+function buildHeaders(rawHeaders, ct, hasBody) {
+  const out = {};
+
+  // لایه ۱: هدرهای مجاز از کلاینت
+  if (rawHeaders && typeof rawHeaders === 'object') {
+    for (const [k, v] of Object.entries(rawHeaders)) {
+      if (typeof k !== 'string' || typeof v !== 'string') continue;
+      if (k.length > 100 || v.length > 8192)             continue;
+      if (!/^[\w\-]+$/.test(k))                           continue;
+      if (!isBlocked(k)) out[k.toLowerCase()] = v;
     }
   }
 
-  // ── لایه ۲: content-type ─────────────────────────────────────────
+  // لایه ۲: content-type
   if (ct && typeof ct === 'string') {
-    headers['content-type'] = ct;
-  } else if (hasBody && !headers['content-type']) {
-    headers['content-type'] = 'application/octet-stream';
+    out['content-type'] = ct;
+  } else if (hasBody && !out['content-type']) {
+    out['content-type'] = 'application/octet-stream';
   }
 
-  // ── لایه ۳: هدرهای اجباری relay — اینا آخر اعمال میشن ──────────
-  // هیچ چیزی نمیتونه اینا رو override کنه
-  headers['connection']       = 'close';
-  headers['user-agent']       = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  // لایه ۳: هدرهای اجباری relay — آخر اعمال میشن (override میکنن)
+  out['connection']  = 'close';
+  out['user-agent']  = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-  // ── صریحاً حذف: مطمئن میشیم این هدرها وجود ندارن ───────────────
-  delete headers['via'];
-  delete headers['forwarded'];
-  delete headers['x-forwarded-for'];
-  delete headers['x-forwarded-host'];
-  delete headers['x-forwarded-proto'];
-  delete headers['x-forwarded-port'];
-  delete headers['x-real-ip'];
+  // لایه ۴: حذف صریح — دفاع آخر
+  delete out['via'];
+  delete out['forwarded'];
+  delete out['x-forwarded-for'];
+  delete out['x-forwarded-host'];
+  delete out['x-forwarded-proto'];
+  delete out['x-forwarded-port'];
+  delete out['x-real-ip'];
 
-  return headers;
+  return out;
 }
 
 // ════════════════════════════════════════════════════════════════════
-// Custom fetch با agent کنترل‌شده
-// Node.js built-in fetch از agent پشتیبانی نمیکنه
-// از undici که داخل Node.js 18+ هست استفاده میکنیم
+// relayFetch — با node:http/https مستقیم
+// دلیل: fetch داخلی Node.js از agent پشتیبانی نمیکنه
+//        و ما به family:4 در سطح socket نیاز داریم
 // ════════════════════════════════════════════════════════════════════
 
-import { request as undiciRequest } from 'undici';
+function relayFetch(targetUrl, { method, headers, body, signal }) {
+  return new Promise((resolve, reject) => {
+    const parsed  = new URL(targetUrl);
+    const isHttps = parsed.protocol === 'https:';
+    const agent   = isHttps ? HTTPS_AGENT : HTTP_AGENT;
+    const mod     = isHttps ? https : http;
 
-async function relayFetch(url, { method, headers, body, signal }) {
-  const parsed = new URL(url);
+    const options = {
+      hostname : parsed.hostname,
+      port     : parsed.port || (isHttps ? 443 : 80),
+      path     : parsed.pathname + parsed.search,
+      method   : method,
+      headers  : headers,
+      agent    : agent,
+      timeout  : 25000,
+    };
 
-  const result = await undiciRequest(url, {
-    method,
-    headers,
-    body: body || null,
-    signal,
-    maxRedirections: 10,
+    const reqHandle = mod.request(options, (upstream) => {
+      const chunks = [];
+      let totalSize = 0;
 
-    // ── مهم‌ترین بخش: کنترل connection ───────────────────────────
-    headersTimeout: 25000,
-    bodyTimeout: 25000,
+      upstream.on('data', (chunk) => {
+        totalSize += chunk.length;
+        if (totalSize > MAX_BODY_SIZE) {
+          reqHandle.destroy();
+          reject(new Error('RESPONSE_TOO_LARGE'));
+          return;
+        }
+        chunks.push(chunk);
+      });
 
-    // اجبار IPv4 در سطح undici
-    connect: {
-      rejectUnauthorized: false,
-      // undici از این تنظیم برای انتخاب IP family استفاده میکنه
-      lookup: (hostname, options, callback) => {
-        // اجبار IPv4
-        const dnsOptions = { ...options, family: 4 };
-        dns.lookup(hostname, dnsOptions, callback);
-      },
-    },
+      upstream.on('end', () => {
+        resolve({
+          statusCode : upstream.statusCode,
+          headers    : upstream.headers,
+          body       : Buffer.concat(chunks),
+        });
+      });
+
+      upstream.on('error', reject);
+    });
+
+    // ── signal (AbortController) ──────────────────────────────────
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        reqHandle.destroy();
+        reject(Object.assign(new Error('AbortError'), { name: 'AbortError' }));
+      }, { once: true });
+    }
+
+    reqHandle.on('timeout', () => {
+      reqHandle.destroy();
+      reject(Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }));
+    });
+
+    reqHandle.on('error', reject);
+
+    // ── body ─────────────────────────────────────────────────────
+    if (body && !['GET', 'HEAD'].includes(method)) {
+      reqHandle.write(body);
+    }
+
+    reqHandle.end();
   });
-
-  return result;
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -164,23 +204,22 @@ app.use(express.json({ limit: '20mb' }));
 // ─── Health Check ─────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
   res.json({
-    ok: true,
-    server: 'france-relay',
-    node: process.version,
-    uptime: Math.floor(process.uptime()),
-    ts: Date.now(),
+    ok     : true,
+    server : 'france-relay',
+    node   : process.version,
+    uptime : Math.floor(process.uptime()),
+    ts     : Date.now(),
     security: {
-      ipv4_forced:              true,
-      connection_close:         true,
-      identity_headers_blocked: true,
-      via_header_stripped:      true,
-      forwarded_stripped:       true,
+      ipv4_forced   : true,
+      connection_close: true,
+      via_stripped  : true,
+      xff_stripped  : true,
     },
   });
 });
 
 // ════════════════════════════════════════════════════════════════════
-// Main Relay
+// Main Relay Endpoint
 // ════════════════════════════════════════════════════════════════════
 
 app.post('/', async (req, res) => {
@@ -211,22 +250,20 @@ app.post('/', async (req, res) => {
 
   // ── ۳. Method ─────────────────────────────────────────────────────
   const method = (m || 'GET').toUpperCase();
-  const ALLOWED = new Set(['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS']);
-  if (!ALLOWED.has(method)) {
+  const ALLOWED_METHODS = new Set(['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS']);
+  if (!ALLOWED_METHODS.has(method)) {
     return res.status(400).json({ e: 'method not allowed' });
   }
 
-  // ── ۴. ساخت هدرهای تمیز ──────────────────────────────────────────
-  const rawHeaders = (h && typeof h === 'object') ? h : {};
-  const headers = buildCleanHeaders(rawHeaders, ct, !!b);
+  // ── ۴. هدرها ──────────────────────────────────────────────────────
+  const headers = buildHeaders(h || {}, ct, !!b);
 
   // ── ۵. Body ───────────────────────────────────────────────────────
-  const MAX = 50 * 1024 * 1024;
   let reqBody;
   if (b && typeof b === 'string') {
     try {
       reqBody = Buffer.from(b, 'base64');
-      if (reqBody.length > MAX) {
+      if (reqBody.length > MAX_BODY_SIZE) {
         return res.status(413).json({ e: 'request body too large' });
       }
     } catch {
@@ -242,51 +279,41 @@ app.post('/', async (req, res) => {
     const upstream = await relayFetch(targetUrl.toString(), {
       method,
       headers,
-      body  : ['GET', 'HEAD'].includes(method) ? undefined : reqBody,
+      body  : reqBody,
       signal: controller.signal,
     });
 
     clearTimeout(timer);
 
-    // ── ۷. Response ───────────────────────────────────────────────────
-    const chunks = [];
-    for await (const chunk of upstream.body) {
-      chunks.push(chunk);
-    }
-    const buf = Buffer.concat(chunks);
-
-    if (buf.length > MAX) {
+    if (upstream.body.length > MAX_BODY_SIZE) {
       return res.status(413).json({ e: 'response too large' });
     }
 
-    // ── ۸. Response headers — بدون set-cookie ────────────────────────
+    // ── response headers — بدون set-cookie ────────────────────────
     const respHeaders = {};
     for (const [k, v] of Object.entries(upstream.headers)) {
-      if (k !== 'set-cookie') {
-        respHeaders[k] = Array.isArray(v) ? v.join(', ') : v;
-      }
+      if (k === 'set-cookie') continue;
+      respHeaders[k] = Array.isArray(v) ? v.join(', ') : v;
     }
 
     return res.json({
       s: upstream.statusCode,
       h: respHeaders,
-      b: buf.toString('base64'),
+      b: upstream.body.toString('base64'),
     });
 
   } catch (err) {
     clearTimeout(timer);
 
-    if (err.name === 'AbortError') {
-      return res.status(504).json({ e: 'upstream timeout' });
-    }
+    if (err.name === 'AbortError')          return res.status(504).json({ e: 'upstream timeout' });
+    if (err.message === 'RESPONSE_TOO_LARGE') return res.status(413).json({ e: 'response too large' });
 
     const code = err.code;
     if (code === 'ECONNREFUSED') return res.status(502).json({ e: 'connection refused' });
     if (code === 'ENOTFOUND')    return res.status(502).json({ e: 'dns lookup failed' });
     if (code === 'ETIMEDOUT')    return res.status(504).json({ e: 'connection timeout' });
-    if (code === 'UND_ERR_CONNECT_TIMEOUT') return res.status(504).json({ e: 'connect timeout' });
 
-    console.error('[relay] error:', err.message, err.code);
+    console.error('[relay] error:', err.message, err.code || '');
     return res.status(502).json({ e: 'fetch failed' });
   }
 });
@@ -298,21 +325,26 @@ app.use((_req, res) => res.status(404).json({ e: 'not found' }));
 const server = app.listen(+PORT, '0.0.0.0', () => {
   console.log('');
   console.log('  ┌────────────────────────────────────────────┐');
-  console.log('  │   🇫🇷  France Relay v4.0 — mhr-cfw        │');
+  console.log('  │   🇫🇷  France Relay v4.1 — mhr-cfw        │');
   console.log('  └────────────────────────────────────────────┘');
-  console.log('  Port         : ' + PORT);
-  console.log('  Node         : ' + process.version);
-  console.log('  Auth         : ' + (API_KEY !== 'changeme' ? '✅' : '⚠️  CHANGE API_KEY!'));
-  console.log('  IPv4-only    : ✅ (dns + socket level)');
-  console.log('  via stripped : ✅');
-  console.log('  XFF stripped : ✅');
-  console.log('  Conn-close   : ✅');
+  console.log('  Port      : ' + PORT);
+  console.log('  Node      : ' + process.version);
+  console.log('  Auth      : ' + (API_KEY !== 'changeme' ? '✅ configured' : '⚠️  CHANGE API_KEY!'));
+  console.log('  IPv4-only : ✅ (dns + socket level)');
+  console.log('  via       : ✅ stripped');
+  console.log('  XFF       : ✅ stripped');
+  console.log('  Conn-close: ✅');
+  console.log('  undici    : ❌ not needed (pure node:http)');
   console.log('');
 });
 
+// ─── Graceful Shutdown ────────────────────────────────────────────
 const shutdown = (sig) => {
-  console.log('\n  ' + sig + ' received...');
-  server.close(() => process.exit(0));
+  console.log('\n  ' + sig + ' — shutting down...');
+  server.close(() => {
+    console.log('  Server closed.');
+    process.exit(0);
+  });
 };
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
