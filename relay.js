@@ -188,7 +188,7 @@ app.use((_req, res) => res.status(404).json({ e: 'not found' }));
 const server = app.listen(+PORT, '0.0.0.0', () => {
   console.log('');
   console.log('  ┌──────────────────────────────────────┐');
-  console.log('  │   🇫🇷  France Relay — mhr-cfw        │');
+  console.log('  │   GR  GERMANY Relay — mhr-cfw        │');
   console.log('  └──────────────────────────────────────┘');
   console.log('  Port   : ' + PORT);
   console.log('  Node   : ' + process.version);
