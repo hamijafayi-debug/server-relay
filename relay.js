@@ -23,7 +23,7 @@ const { API_KEY = 'changeme', PORT = '3000' } = process.env;
 // هدرهایی که نباید به upstream فرستاده شوند
 const BLOCKED_HEADERS = new Set([
   'host', 'connection', 'transfer-encoding',
-  'content-length', 'x-relay-hop', 'proxy-authorization',
+  'content-length', 'x-relay-hop', 'x-fwd-hop', 'proxy-authorization',
   'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto',
   'forwarded', 'via',
 ]);
@@ -52,20 +52,25 @@ app.get('/health', (_req, res) => {
 // ─── Main Relay Endpoint ──────────────────────────────────────────
 app.post('/', async (req, res) => {
 
-  // ── ۱. احراز هویت ────────────────────────────────────────────────
+  // ── ۱. Loop detection — جلوگیری از self-fetch ────────────────────
+  if (req.headers['x-relay-hop'] === '1' || req.headers['x-fwd-hop'] === '1') {
+    return res.status(508).json({ e: 'loop detected' });
+  }
+
+  // ── ۲. احراز هویت ────────────────────────────────────────────────
   const key = req.body?.k || req.headers['x-api-key'];
   if (!key || key !== API_KEY) {
     return res.status(401).json({ e: 'unauthorized' });
   }
 
-  // ── ۲. پارامترها ──────────────────────────────────────────────────
+  // ── ۳. پارامترها ──────────────────────────────────────────────────
   const { u, m, h, b, ct, r } = req.body;
 
   if (!u || typeof u !== 'string') {
     return res.status(400).json({ e: 'missing url' });
   }
 
-  // ── ۳. URL validation ─────────────────────────────────────────────
+  // ── ۴. URL validation ─────────────────────────────────────────────
   let targetUrl;
   try {
     targetUrl = new URL(u);
@@ -77,13 +82,19 @@ app.post('/', async (req, res) => {
     return res.status(400).json({ e: 'protocol not allowed' });
   }
 
-  // ── ۴. Method ─────────────────────────────────────────────────────
+  // ── ۵. Self-fetch block — جلوگیری از loop از طریق URL ─────────────
+  const selfHost = req.headers['host'] || '';
+  if (selfHost && targetUrl.hostname === selfHost.split(':')[0]) {
+    return res.status(400).json({ e: 'self-fetch blocked' });
+  }
+
+  // ── ۶. Method ─────────────────────────────────────────────────────
   const method = (m || 'GET').toUpperCase();
   if (!ALLOWED_METHODS.has(method)) {
     return res.status(400).json({ e: 'method not allowed' });
   }
 
-  // ── ۵. Headers — ساخت از صفر، فقط از فیلد h (body) ───────────────
+  // ── ۷. Headers — ساخت از صفر، فقط از فیلد h (body) ───────────────
   const headers = {};
   if (h && typeof h === 'object') {
     for (const [k, v] of Object.entries(h)) {
@@ -105,7 +116,7 @@ app.post('/', async (req, res) => {
   ['x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'forwarded', 'via']
     .forEach(hdr => delete headers[hdr]);
 
-  // ── ۶. Body decode (base64 → Buffer) ─────────────────────────────
+  // ── ۸. Body decode (base64 → Buffer) ─────────────────────────────
   let reqBody;
   if (b && typeof b === 'string') {
     try {
@@ -115,7 +126,7 @@ app.post('/', async (req, res) => {
     }
   }
 
-  // ── ۷. Fetch با timeout 25s (کمتر از GAS timeout 30s) ────────────
+  // ── ۹. Fetch با timeout 25s (کمتر از GAS timeout 30s) ────────────
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 25_000);
 
@@ -130,23 +141,23 @@ app.post('/', async (req, res) => {
 
     clearTimeout(timer);
 
-    // ── ۸. چک حجم response قبل از خوندن ──────────────────────────────
+    // ── ۱۰. چک حجم response قبل از خوندن ─────────────────────────────
     const cl = parseInt(upstream.headers.get('content-length') || '0', 10);
     if (cl > MAX_BODY_SIZE) {
       return res.status(413).json({ e: 'response too large' });
     }
 
-    // ── ۹. خوندن body ─────────────────────────────────────────────────
+    // ── ۱۱. خوندن body ────────────────────────────────────────────────
     const buf = Buffer.from(await upstream.arrayBuffer());
     if (buf.length > MAX_BODY_SIZE) {
       return res.status(413).json({ e: 'response too large' });
     }
 
-    // ── ۱۰. جمع‌آوری response headers ─────────────────────────────────
+    // ── ۱۲. جمع‌آوری response headers ──────────────────────────────────
     const respHeaders = {};
     upstream.headers.forEach((v, k) => { respHeaders[k] = v; });
 
-    // ── ۱۱. خروجی — فرمت دقیق mhr-cfw: { s, h, b } ───────────────────
+    // ── ۱۳. خروجی — فرمت دقیق mhr-cfw: { s, h, b } ────────────────────
     return res.json({
       s: upstream.status,
       h: respHeaders,
