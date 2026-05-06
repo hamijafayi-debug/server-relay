@@ -1,9 +1,13 @@
 // ═══════════════════════════════════════════════════════════════════
-// relay.js — France Relay Server (Streaming & Long-Polling Edition)
+// relay.js — France Relay Server (Streaming, IPv4-Forced, Cookie-Safe)
 // ═══════════════════════════════════════════════════════════════════
 
 import express from 'express';
 import crypto from 'crypto';
+import dns from 'dns';
+
+// ── حیاتی: اجبار به استفاده از IPv4 برای رفع مشکل تایم‌اوت‌های داکر ──
+dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
 const { API_KEY = 'changeme', PORT = '3000' } = process.env;
@@ -20,7 +24,7 @@ const MAX_BODY_SIZE = 50 * 1024 * 1024; // 50MB
 const sessions = new Map();
 const SESSION_TIMEOUT = 60 * 1000;
 
-// Garbage Collector برای جلوگیری از Memory Leak
+// Garbage Collector
 setInterval(() => {
   const now = Date.now();
   for (const [id, session] of sessions.entries()) {
@@ -33,7 +37,7 @@ setInterval(() => {
 app.set('trust proxy', false);
 app.use(express.json({ limit: '20mb' }));
 
-// ── روت Health Check برای Coolify و Docker ──
+// روت Health Check برای Coolify
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', streaming: 'active' });
 });
@@ -44,15 +48,12 @@ app.post('/', async (req, res) => {
   const key = req.body?.k || req.headers['x-api-key'];
   if (!key || key !== API_KEY) return res.status(401).json({ e: 'unauthorized' });
 
-  // ── ۱. هندل کردن Long-Polling ──────────────────────────────────────
+  // ۱. هندل کردن Long-Polling
   if (req.body.poll_session_id) {
     const session = sessions.get(req.body.poll_session_id);
     if (!session) return res.status(404).json({ e: 'session expired or invalid' });
 
     session.lastAccessed = Date.now();
-
-    // Long Polling: اگر چانکی نداریم و استریم باز است، تا 15 ثانیه منتظر می‌مانیم
-    // این کار مصرف Quota در GAS را به شدت کاهش می‌دهد
     let waited = 0;
     while (session.chunks.length === 0 && !session.done && waited < 15000) {
       await new Promise(r => setTimeout(r, 250));
@@ -65,14 +66,14 @@ app.post('/', async (req, res) => {
       session_id: req.body.poll_session_id, 
       chunks, 
       done: session.done,
-      stream_error: session.error // ارسال ارور احتمالی قطعی
+      stream_error: session.error
     };
 
     if (session.done && chunks.length === 0) sessions.delete(req.body.poll_session_id);
     return res.json(responseData);
   }
 
-  // ── ۲. بررسی و آماده‌سازی درخواست اصلی ──────────────────────────────
+  // ۲. بررسی و آماده‌سازی درخواست اصلی
   const { u, m, h, b, ct, r, stream } = req.body;
   if (!u || typeof u !== 'string') return res.status(400).json({ e: 'missing url' });
 
@@ -99,7 +100,7 @@ app.post('/', async (req, res) => {
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 25_000); // تایم‌اوت اتصال اولیه
+  const timer = setTimeout(() => controller.abort(), 25_000);
 
   try {
     const upstream = await fetch(targetUrl.toString(), {
@@ -110,9 +111,22 @@ app.post('/', async (req, res) => {
       signal: controller.signal,
     });
 
-    clearTimeout(timer); // کانکشن برقرار شد، تایم‌اوت باطل می‌شود
+    clearTimeout(timer);
 
-    // ── ۳. پردازش حالت Streaming (بدون اختلال در RAM) ──────────────────
+    // ── استخراج امن هدرها و جلوگیری از خرابی کوکی‌ها ──
+    const extractSafeHeaders = (fetchHeaders) => {
+      const safeHeaders = {};
+      fetchHeaders.forEach((v, k) => {
+        if (k.toLowerCase() === 'set-cookie') return; // کوکی‌ها را جداگانه هندل می‌کنیم
+        safeHeaders[k] = v;
+      });
+      // استخراج کوکی‌ها به صورت آرایه برای جلوگیری از تداخل
+      const cookies = fetchHeaders.getSetCookie ? fetchHeaders.getSetCookie() : [];
+      if (cookies.length > 0) safeHeaders['set-cookie'] = cookies;
+      return safeHeaders;
+    };
+
+    // ۳. پردازش حالت Streaming
     if (stream) {
       const sessionId = crypto.randomUUID();
       sessions.set(sessionId, { chunks: [], done: false, lastAccessed: Date.now(), error: null });
@@ -129,9 +143,8 @@ app.post('/', async (req, res) => {
             if (done) break;
             
             const session = sessions.get(sessionId);
-            if (!session) break; // سشن بخاطر تایم‌اوت بسته شده
+            if (!session) break;
             
-            // تبدیل امن بایت‌ها به Base64
             session.chunks.push(Buffer.from(value).toString('base64'));
           }
         } catch (err) {
@@ -143,44 +156,40 @@ app.post('/', async (req, res) => {
         }
       })();
 
-      // ── مکث اولیه تطبیق‌پذیر (Adaptive Wait) ──
-      // به جای 1 ثانیه صبر مطلق، تا زمانی که اولین چانک آماده شود (نهایت 2 ثانیه) چک می‌کنیم
       let waitedInit = 0;
       while (
         sessions.get(sessionId)?.chunks.length === 0 && 
         !sessions.get(sessionId)?.done && 
         waitedInit < 2000
       ) {
-        await new Promise(r => setTimeout(r, 100)); // هر 100 میلی‌ثانیه وضعیت را چک کن
+        await new Promise(r => setTimeout(r, 100));
         waitedInit += 100;
       }
-      // ──────────────────────────────────────────
       
       const session = sessions.get(sessionId);
       const chunks = session ? session.chunks.splice(0, session.chunks.length) : [];
-      const respHeaders = {};
-      upstream.headers.forEach((v, k) => { respHeaders[k] = v; });
-
+      
       return res.json({
         s: upstream.status,
-        h: respHeaders,
+        h: extractSafeHeaders(upstream.headers),
         session_id: sessionId,
         chunks: chunks,
         done: session ? session.done : true
       });
     }
 
-    // ── ۴. پردازش حالت عادی (غیر استریم) ──────────────────────────────
+    // ۴. پردازش حالت عادی (غیر استریم)
     const cl = parseInt(upstream.headers.get('content-length') || '0', 10);
     if (cl > MAX_BODY_SIZE) return res.status(413).json({ e: 'response too large' });
 
     const buf = Buffer.from(await upstream.arrayBuffer());
     if (buf.length > MAX_BODY_SIZE) return res.status(413).json({ e: 'response too large' });
 
-    const respHeaders = {};
-    upstream.headers.forEach((v, k) => { respHeaders[k] = v; });
-
-    return res.json({ s: upstream.status, h: respHeaders, b: buf.toString('base64') });
+    return res.json({ 
+      s: upstream.status, 
+      h: extractSafeHeaders(upstream.headers), 
+      b: buf.toString('base64') 
+    });
 
   } catch (err) {
     clearTimeout(timer);
