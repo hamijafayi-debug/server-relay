@@ -33,6 +33,11 @@ setInterval(() => {
 app.set('trust proxy', false);
 app.use(express.json({ limit: '20mb' }));
 
+// ── روت Health Check برای Coolify و Docker ──
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', streaming: 'active' });
+});
+
 app.post('/', async (req, res) => {
   if (req.headers['x-relay-hop'] === '1') return res.status(508).json({ e: 'loop detected' });
 
